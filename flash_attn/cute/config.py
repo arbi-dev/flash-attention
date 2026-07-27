@@ -219,6 +219,7 @@ class FwdMainKernelSpec(NamedTuple):
 class FwdCombineKernelSpec(NamedTuple):
     """Typed cache key for one generated SplitKV combine kernel."""
 
+    arch: int
     dtype: object
     dtype_partial: object
     head_dim: int

@@ -1,9 +1,11 @@
+import inspect
 import json
 from dataclasses import asdict, replace
 
 import pytest
 
 from flash_attn.cute.config import (
+    FwdCombineKernelSpec,
     FwdConfig,
     FwdHeuristicInputs,
     FwdRegisterAllocation,
@@ -15,6 +17,7 @@ from flash_attn.cute.config import (
     select_sm100_register_allocation,
     validate_fwd_config,
 )
+from flash_attn.cute.interface import _flash_attn_fwd
 
 
 def make_inputs(**changes) -> FwdHeuristicInputs:
@@ -65,6 +68,13 @@ def make_inputs(**changes) -> FwdHeuristicInputs:
 
 def replace_inputs(inputs: FwdHeuristicInputs, **changes) -> FwdHeuristicInputs:
     return inputs._replace(**changes)
+
+
+def test_forward_config_is_optional_and_keyword_only():
+    parameter = inspect.signature(_flash_attn_fwd).parameters["config"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
 
 
 def test_selector_inputs_and_config_are_hashable():
@@ -461,6 +471,26 @@ def test_non_sm100_configs_do_not_expose_register_allocation():
         validate_fwd_config(
             replace(config, registers=FwdRegisterAllocation(128, 128, 128)), inputs
         )
+
+
+def test_combine_specialization_is_architecture_specific():
+    spec = FwdCombineKernelSpec(
+        arch=100,
+        dtype="bf16",
+        dtype_partial="fp32",
+        head_dim=128,
+        tile_m=8,
+        k_block_size=128,
+        log_max_splits=5,
+        has_cu_seqlens=False,
+        has_seqused=False,
+        has_lse=False,
+        has_num_splits_dynamic_ptr=False,
+        has_varlen_batch_idx=False,
+        has_semaphore_to_reset=False,
+    )
+
+    assert spec != spec._replace(arch=103)
 
 
 def test_specialization_projects_exact_split_counts_per_kernel():
