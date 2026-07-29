@@ -31,8 +31,11 @@ from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
     get_aux_tensor_metadata,
     get_broadcast_dims,
+    get_num_sms_for_selection,
+    maybe_contiguous,
     to_cute_aux_tensor,
     to_cute_tensor,
+    validate_output_layout,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
@@ -83,9 +86,10 @@ def _get_device_arch():
     kernel path to use (SM80/SM90/SM100/SM120) independently of the compilation
     target (CUTE_DSL_ARCH).
 
-    For CPU-only compilation (no GPU), set both:
+    For CPU-only compilation (no GPU), set:
       FLASH_ATTENTION_ARCH=sm_80  (kernel selection)
       CUTE_DSL_ARCH=sm_80         (compilation target)
+      FLASH_ATTENTION_NUM_SMS=132 (target-SKU selector metadata)
     """
     arch_override = os.environ.get("FLASH_ATTENTION_ARCH", None)
     if arch_override is not None:
@@ -94,6 +98,7 @@ def _get_device_arch():
     return major * 10 + int(minor)
 
 
+@lru_cache(maxsize=None)
 def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
     """Validate head dimension constraints based on compute capability."""
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
@@ -239,16 +244,11 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
 
 
 
-def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
-
-
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.shape == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
     assert t.dtype == expected_dtype, f"{name} dtype {t.dtype} != expected {expected_dtype}"
     assert t.device == expected_device, f"{name} device {t.device} != expected {expected_device}"
-    if not is_fake_mode():
-        assert t.is_cuda, f"{name} must be on CUDA"
+    assert t.is_cuda, f"{name} must be on CUDA"
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -295,6 +295,7 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     else:
         local = False
     return causal, local, window_size_left, window_size_right
+
 
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
@@ -350,10 +351,16 @@ def _flash_attn_fwd(
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    fake_mode = is_fake_mode()
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
-    q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
+    q_descale, k_descale, v_descale = [
+        maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
+    ]
+    page_table = maybe_contiguous(page_table, align_bytes=4)
+    learnable_sink = maybe_contiguous(learnable_sink, align_bytes=4)
+    gather_kv_indices = maybe_contiguous(gather_kv_indices, align_bytes=16)
     q_shape = q.shape if q is not None else qv.shape
     num_head, head_dim = q_shape[-2:]
     if cu_seqlens_q is None:
@@ -404,13 +411,9 @@ def _flash_attn_fwd(
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
     
-    input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
-    present = {name: t for name, t in input_tensors.items() if t is not None}
-    names = list(present.keys())
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            a, b = names[i], names[j]
-            assert present[a].dtype == present[b].dtype, f"{a}.dtype {present[a].dtype} != {b}.dtype {present[b].dtype}"
+    assert all(t is None or t.dtype == v.dtype for t in (q, k, qv)), (
+        "q, k, v, and qv must have the same dtype"
+    )
 
     q_dtype = q.dtype if q is not None else qv.dtype
 
@@ -426,7 +429,7 @@ def _flash_attn_fwd(
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
 
-    if not is_fake_mode():
+    if not fake_mode:
         assert all(
             t is None or t.is_cuda
             for t in (
@@ -481,7 +484,14 @@ def _flash_attn_fwd(
             *q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device
         )
     else:
-        _validate_tensor(out, "out", (*q_batch_seqlen_shape, num_head, head_dim_v), out_torch_dtype, device)
+        _validate_tensor(
+            out,
+            "out",
+            (*q_batch_seqlen_shape, num_head, head_dim_v),
+            out_torch_dtype,
+            device,
+        )
+        validate_output_layout(out, "out", align_bytes=16)
 
     if lse is None:
         lse = (
@@ -491,6 +501,7 @@ def _flash_attn_fwd(
         )
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
+        validate_output_layout(lse, "lse", align_bytes=4)
 
     if seqlen_k == 0 or total_q == 0:
         out.zero_()
@@ -501,7 +512,13 @@ def _flash_attn_fwd(
     if is_fp8:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:
-                _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, device)
+                _validate_tensor(
+                    t,
+                    name,
+                    (batch_size, num_head_kv),
+                    torch.float32,
+                    device,
+                )
     else:
         assert q_descale is None and k_descale is None and v_descale is None, (
             "q_descale/k_descale/v_descale are only supported for FP8 inputs"
@@ -519,11 +536,12 @@ def _flash_attn_fwd(
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
 
-    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
         num_threads = 128
+
+    if cu_seqlens_k is None and seqused_k is None:
+        min_seqlen_k = seqlen_k
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
@@ -565,10 +583,11 @@ def _flash_attn_fwd(
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-    num_SMs = 132 if is_fake_mode() else torch.cuda.get_device_properties(device).multi_processor_count
+    num_SMs = None
     if arch // 10 == 12:
         assert num_splits == 1, "SM120 forward only supports num_splits=1"
     elif num_splits < 1:
+        num_SMs = get_num_sms_for_selection(device.index, arch)
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
@@ -577,6 +596,8 @@ def _flash_attn_fwd(
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
+            if num_SMs is None:
+                num_SMs = get_num_sms_for_selection(device.index, arch)
             num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
         else:
             num_splits = 1
@@ -729,6 +750,22 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask = None
         p = row_max = None
 
+    # CuTe keeps stride-zero modes static when marking layouts dynamic.
+    tensor_broadcast_patterns = tuple(
+        get_broadcast_dims(tensor) if tensor is not None else None
+        for tensor in (
+            q,
+            k,
+            v,
+            qv,
+            page_table,
+            q_descale,
+            k_descale,
+            v_descale,
+            gather_kv_indices,
+        )
+    )
+
     compile_key = (
         dtype,
         head_dim,
@@ -739,6 +776,7 @@ def _flash_attn_fwd(
         mask_mod_hash,
         use_block_sparsity,
         block_sparse_broadcast_pattern,
+        tensor_broadcast_patterns,
         aux_tensor_metadata,
         aux_scalar_metadata,
         lse is None,
@@ -780,6 +818,7 @@ def _flash_attn_fwd(
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
+        current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         (
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
@@ -1032,7 +1071,7 @@ def _flash_attn_fwd(
                 *compile_args, options="--enable-tvm-ffi"
             )
 
-    if not is_fake_mode():
+    if not fake_mode:
         q_call, k_call, v_call, qv_call = [
             t.detach() if t is not None else None
             for t in (q, k, v, qv)
@@ -1111,6 +1150,7 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
+            _arch=arch,
         )
     return out, lse, p, row_max
 
@@ -1226,6 +1266,8 @@ def _bwd_preprocess(
     qhead_per_kvhead=1,  # only used with pack_gqa
     nheads_kv=1,         # only used with pack_gqa
     softmax_scale=1.0,   # only used with scale_p
+    *,
+    fake_mode,
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
     if row_max is not None:
@@ -1245,7 +1287,7 @@ def _bwd_preprocess(
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
-    if not is_fake_mode():
+    if not fake_mode:
         _bwd_preprocess.compile_cache[compile_key](
             out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse,
             row_max, scale_p,
@@ -1287,6 +1329,8 @@ def _bwd_postprocess_convert(
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
     use_2cta_instrs=False, cluster_size=1,
+    *,
+    fake_mode,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
     compile_key = (
@@ -1296,7 +1340,7 @@ def _bwd_postprocess_convert(
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
-    if not is_fake_mode():
+    if not fake_mode:
         _bwd_postprocess_convert.compile_cache[compile_key](
             accum, output, scale, cu_seqlens, seqused,
         )
@@ -1349,6 +1393,7 @@ def _flash_attn_bwd(
     dlse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
+    fake_mode = is_fake_mode()
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     if block_sparse_tensors is not None:
@@ -1539,7 +1584,7 @@ def _flash_attn_bwd(
     assert lse.dtype == torch.float32, "lse must be float32"
     if dlse is not None:
         dlse = maybe_contiguous(dlse)
-    if not is_fake_mode():
+    if not fake_mode:
         assert all(
             t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
         ), "inputs must be on CUDA device"
@@ -1659,7 +1704,6 @@ def _flash_attn_bwd(
             )
 
     dtype = torch2cute_dtype_map[q.dtype]
-    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     if deterministic:
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
@@ -1679,6 +1723,7 @@ def _flash_attn_bwd(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
+        fake_mode=fake_mode,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
@@ -1692,9 +1737,6 @@ def _flash_attn_bwd(
     num_aux_tensors = len(aux_tensors) if aux_tensors else 0
     aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors) if aux_tensors is not None else None
     aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
-    cute_aux_tensors = None
-    if aux_tensors is not None:
-        cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
@@ -1825,6 +1867,12 @@ def _flash_attn_bwd(
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
+        current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        cute_aux_tensors = (
+            [to_cute_aux_tensor(buf) for buf in aux_tensors]
+            if aux_tensors is not None
+            else None
+        )
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
@@ -1983,7 +2031,7 @@ def _flash_attn_bwd(
             current_stream,
             options="--enable-tvm-ffi",
         )
-    if not is_fake_mode():
+    if not fake_mode:
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
         _flash_attn_bwd.compile_cache[compile_key](
             q.detach(),
@@ -2036,6 +2084,7 @@ def _flash_attn_bwd(
             arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
             AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+            fake_mode=fake_mode,
         )
 
         if dKV_postprocess:
@@ -2046,6 +2095,7 @@ def _flash_attn_bwd(
                 arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
+                fake_mode=fake_mode,
             )
             # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
             _bwd_postprocess_convert(
@@ -2054,6 +2104,7 @@ def _flash_attn_bwd(
                 arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
+                fake_mode=fake_mode,
             )
 
     return dq, dk, dv
@@ -2092,6 +2143,7 @@ def _flash_attn_bwd_sparse_mla(
     dv: Optional[torch.Tensor] = None,
     dqv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    fake_mode = is_fake_mode()
     arch = _get_device_arch()
     assert arch // 10 in [10, 11], "Unsupported compute capability. Supported: 10.x, 11.x"
     assert gather_kv_indices is not None, "require gather kv indices for backward"
@@ -2186,7 +2238,6 @@ def _flash_attn_bwd_sparse_mla(
     scale_p = torch.empty_like(row_max)
 
     dtype = torch2cute_dtype_map[dout.dtype]
-    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), scale_p.
     _bwd_preprocess(
@@ -2201,6 +2252,7 @@ def _flash_attn_bwd_sparse_mla(
         qhead_per_kvhead=qhead_per_kvhead,
         nheads_kv=nheads_kv,
         softmax_scale=softmax_scale,
+        fake_mode=fake_mode,
     )
 
     compile_key = (
@@ -2220,6 +2272,7 @@ def _flash_attn_bwd_sparse_mla(
     )
 
     if compile_key not in _flash_attn_bwd_sparse_mla.compile_cache:
+        current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         (
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
@@ -2273,7 +2326,7 @@ def _flash_attn_bwd_sparse_mla(
         )
         _flash_attn_bwd_sparse_mla.compile_cache[compile_key] = fa_bwd_kernel
 
-    if not is_fake_mode():
+    if not fake_mode:
         _flash_attn_bwd_sparse_mla.compile_cache[compile_key](
             dout,
             v,
@@ -2907,8 +2960,9 @@ def flash_attn_varlen_func(
 
 
 def _compile_fwd_combine(
-    dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
-    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
+    _arch, dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
+    has_cu_seqlens, has_seqused, has_lse, has_num_splits_dynamic_ptr,
+    has_varlen_batch_idx, has_semaphore_to_reset,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -2950,9 +3004,13 @@ def _compile_fwd_combine(
     batchp1 = sym()
     mCuSeqlens = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_seqlens else None
     mSeqused = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_seqused else None
-    mNumSplitsDynamic = None  # Not parametrized in compile_key
+    mNumSplitsDynamic = (
+        fake_tensor(Int32, (batch_for_1d,), divisibility=1)
+        if has_num_splits_dynamic_ptr
+        else None
+    )
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
-    mSemaphore = None  # Not parametrized in compile_key
+    mSemaphore = fake_tensor(Int32, (1,), divisibility=1) if has_semaphore_to_reset else None
 
     return cute.compile(
         fa_combine,
@@ -2973,6 +3031,8 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
+    *,
+    _arch: Optional[int] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -2995,23 +3055,23 @@ def _flash_attn_fwd_combine(
     Returns:
         None
     """
+    fake_mode = is_fake_mode()
     assert out_partial.dtype in [torch.float16, torch.bfloat16, torch.float32], (
         "out_partial must be fp16, bf16, or fp32"
     )
-    if not is_fake_mode():
+    if not fake_mode:
         assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
-    # Determine if this is variable length based on dimensions
-    is_varlen = out_partial.dim() == 4
-    # Validate optional tensors
-    for t, name in [
+    for tensor, name in (
         (cu_seqlens, "cu_seqlens"),
         (seqused, "seqused"),
         (num_splits_dynamic_ptr, "num_splits_dynamic_ptr"),
-    ]:
-        if t is not None:
-            if not is_fake_mode():
-                assert t.is_cuda, f"{name} must be on CUDA device"
-            assert t.is_contiguous(), f"{name} must be contiguous"
+        (varlen_batch_idx, "varlen_batch_idx"),
+        (semaphore_to_reset, "semaphore_to_reset"),
+    ):
+        if tensor is not None:
+            if not fake_mode:
+                assert tensor.is_cuda, f"{name} must be on CUDA device"
+            assert tensor.is_contiguous(), f"{name} must be contiguous"
     head_dim = out_partial.shape[-1]
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
@@ -3031,6 +3091,7 @@ def _flash_attn_fwd_combine(
     dtype = torch2cute_dtype_map[out.dtype]
     dtype_partial = torch2cute_dtype_map[out_partial.dtype]
     compile_key = (
+        _get_device_arch() if _arch is None else _arch,
         dtype,
         dtype_partial,
         head_dim,
@@ -3040,13 +3101,15 @@ def _flash_attn_fwd_combine(
         cu_seqlens is not None,
         seqused is not None,
         lse is not None,
+        num_splits_dynamic_ptr is not None,
         varlen_batch_idx is not None,
+        semaphore_to_reset is not None,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
             *compile_key
         )
-    if not is_fake_mode():
+    if not fake_mode:
         _flash_attn_fwd_combine.compile_cache[compile_key](
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
